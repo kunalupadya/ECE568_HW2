@@ -1,0 +1,16 @@
+Need to make sure that all sockets and connections are closed out after we are done using them, even in non happy path/error situations
+
+chunked transfer encoding
+
+what happens if the content length is incorrect? would get back a bad server response, that's on the user
+
+Sockets seem to have a timeout period in which they cannot be used - this was causing the program to crash when I closed and attempted to reopen an unused socket. This was fixed by using setsockopt and SO_REUSEADDR which makes a socket instantly reusable.
+
+Even with this improvement, sockets should be closed on program exit/cleanup so that the sockets are immediately available when the program is restarted.
+
+When accessing cached responses for a uri, I make the assumption that only the most recent one should need to be considered as in theory this makes sense (as this one should be the most correct/least stale out of all other responses). However, it is posible that a rogue server may respond with random max-age which could break this assumption, or that a resource may change on a server update along with the cache requirements for the resource. This became a big part of my cache invalidation policy, which consisted of 
+
+I log datetime for cache events in seconds instead of in normal formats as this is the format used by the validation headers. This could be confusing to some readers but I think it works sufficiently + is compatible with max-age and maxage-s headers.
+
+Due to the fact that I worked alone rather than in a pair, I was unable to thoroughly implement some of the additional features on this project, such as exception guarantees and being robust to external failures. As I neared the end of this project, I realized how reliant my code was on good behavior from both clients and servers. Because of the amount of raw string parsing done, a malicious client or server could cause the server by for example passing in a bogus field like people=dog which an earlier version of my code parsed as my code as <string>=<int>, but as I changed this to be more robust by checking for the contents of parsed strings. This made me reflect on the benefits of having teammates and finishing early so you have time to clean up things such as exception handling afterwards.
+

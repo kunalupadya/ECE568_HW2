@@ -62,6 +62,21 @@
         "vector": "cpp",
         "__tree": "cpp",
         "map": "cpp",
-        "thread": "cpp"
-    }
+        "thread": "cpp",
+        "deque": "cpp",
+        "fstream": "cpp",
+        "iomanip": "cpp",
+        "stack": "cpp",
+        "queue": "cpp",
+        "codecvt": "cpp",
+        "condition_variable": "cpp",
+        "csignal": "cpp",
+        "list": "cpp",
+        "set": "cpp",
+        "unordered_set": "cpp",
+        "charconv": "cpp",
+        "clocale": "cpp",
+        "span": "cpp"
+    },
+    "C_Cpp.dimInactiveRegions": false
 }

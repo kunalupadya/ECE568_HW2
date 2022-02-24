@@ -1,313 +1,334 @@
 #include <sys/socket.h> // For socket functions
 #include <netinet/in.h> // For sockaddr_in
-#include <cstdlib> // For exit() and EXIT_FAILURE
-#include <iostream> // For cout
-#include <unistd.h> // For read
+#include <cstdlib>      // For exit() and EXIT_FAILURE
+#include <iostream>     // For cout
+#include <unistd.h>     // For read
 #include <thread>
 #include <map>
 #include <cstring>
 #include <netdb.h> /* struct hostent, gethostbyname */
 #include <arpa/inet.h>
 #include "HtmlRequest.h"
+#include "HtmlResponse.h"
+#include "Cache.h"
+#include "Socket.h"
+#include "Sender.h"
+#include "Runner.h"
+#include "easylogging++.h"
+#include <mutex>
 
 using namespace std;
-class Geeks
+
+INITIALIZE_EASYLOGGINGPP
+
+Cache cache;
+std::mutex queue_mutex;
+
+void run(int connection, int id)
 {
-    public:
-    int id;
-     
-    //Default Constructor
-     
-    //Parameterized Constructor
-    Geeks(int x)
+  std::cout << "connected" << std::endl;
+
+  char buffer[10000];
+  std::cout << "bout to read: "
+            << "\r\n";
+
+  int res = recv(connection, buffer, 10000, 0);
+  std::cout << res << "\r\n";
+
+  if (res == 0)
+  {
+    std::cout << "connection closed by client"
+              << "\r\n";
+    return; // connection closed by client
+  }
+
+  // auto bytesRead = read(connection, buffer, 10000);
+
+  std::cout << "req: "
+            << "\r\n";
+  std::cout << buffer << "\r\n";
+  HtmlRequest req(buffer);
+
+  std::cout << req.printRequest() << std::endl;
+
+  std::time_t t = std::time(0); // get time now
+  std::tm *now = std::localtime(&t);
+  char timeBuffer[300];
+  strftime(timeBuffer, 300, "%a, %d %b %Y %H:%M:%S %Z", now);
+  LOG(INFO) << std::to_string(id) << ": \"" << req.requestLine << "\" from " << req.host << " @ " << timeBuffer;
+
+  if (req.method == "CONNECT")
+  {
+
+    std::cout << "connect request recieved" << std::endl;
+    Socket sendSocket(req.host, req.port);
+    std::cout << "socket created" << std::endl;
+
+    std::string resp = "HTTP/1.1 200 OK\r\n\r\n";
+    LOG(INFO) << std::to_string(id) << ": "
+              << "Responding \"HTTP/1.1 200 OK\"";
+    int ret = send(connection, resp.c_str(), strlen(resp.c_str()), 0);
+
+    if (ret <= 0)
     {
-        cout << "Parameterized Constructor called" << endl;
-        id=x;
+      std::cout << "failed to establish connection with client, client unresponsive" << std::endl;
+      std::cout << errno << std::endl;
+      return;
     }
-};
 
+    std::cout << "sent " << resp << std::endl;
 
-void task1(std::string msg)
-{
-    sleep(2);
-    std::cout << "task1 says: " << msg;
+    fd_set readfds;
+    fd_set writefds;
+
+    while (true)
+    {
+      FD_ZERO(&readfds);
+      FD_ZERO(&writefds);
+
+      // add master socket to set
+      FD_SET(sendSocket.sockfd, &readfds);
+      FD_SET(sendSocket.sockfd, &writefds);
+
+      FD_SET(connection, &readfds);
+      FD_SET(connection, &writefds);
+
+      int max_sd = sendSocket.sockfd + 1;
+
+      if (sendSocket.sockfd < connection)
+      {
+        max_sd = connection + 1;
+      }
+
+      std::cout << "blocking here" << std::endl;
+      int activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+      std::cout << "past it" << std::endl;
+      if (FD_ISSET(sendSocket.sockfd, &readfds))
+      {
+
+        char buffer[10000];
+        int res = recv(sendSocket.sockfd, buffer, 10000, 0);
+        std::cout << "send sock " << res << std::endl;
+        if (res <= 0)
+        {
+          close(sendSocket.sockfd);
+          close(connection);
+          break;
+        }
+        if (FD_ISSET(connection, &writefds))
+        {
+          int ret = send(connection, buffer, 10000, 0);
+          if (ret <= 0)
+          {
+            close(sendSocket.sockfd);
+            close(connection);
+            break;
+          }
+        }
+      }
+      else if (FD_ISSET(connection, &readfds))
+      {
+        char buffer[10000];
+        int res = recv(connection, buffer, 10000, 0);
+        std::cout << "conn " << res << std::endl;
+        if (res <= 0)
+        {
+
+          close(sendSocket.sockfd);
+          close(connection);
+          LOG(INFO) << std::to_string(id) << ": \""
+                << "Tunnel Closed";
+          break;
+        }
+        if (FD_ISSET(sendSocket.sockfd, &writefds))
+        {
+          int ret = send(sendSocket.sockfd, buffer, 10000, 0);
+          if (ret <= 0)
+          {
+            close(sendSocket.sockfd);
+            close(connection);
+            LOG(INFO) << std::to_string(id) << ": \""
+                << "Tunnel Closed";
+            break;
+          }
+        }
+      }
+    }
+    
+    return;
+  }
+  std::unique_lock<std::mutex> lock(queue_mutex);
+  std::pair<int, bool> cacheResponse = cache.containsRequest(req);
+  int cacheLocation = cacheResponse.first;
+  bool needsValidation = cacheResponse.second;
+
+  if (cacheLocation != -1)
+  {
+
+    HtmlResponse resp = cache.cache[cacheLocation].second;
+    lock.unlock();
+    if (needsValidation)
+    {
+      LOG(INFO) << std::to_string(id) << ": \""
+                << "in cache, requires validation";
+      std::string etag = "";
+      if (resp.checkIfInHeaders("ETag"))
+      {
+        etag = resp.getHeader("ETag");
+      }
+
+      Socket sendSocket(req.host, req.port);
+
+      Sender sender;
+
+      LOG(INFO) << std::to_string(id) << ": "
+                                         "Requesting "
+                << req.requestLine << " from " << req.host;
+
+      HtmlResponse validationResponse = sender.send(req.printConditionalRequest(resp.getHeader("Date"), etag), sendSocket);
+
+      LOG(INFO) << std::to_string(id) << ": "
+                                         "Recieved "
+                << validationResponse.firstLine << " from " << req.host;
+
+      close(sendSocket.sockfd);
+
+      std::cout << "validation response:" << std::endl
+                << validationResponse.printResponse() << std::endl;
+
+      if (validationResponse.resp_type == "304")
+      {
+        send(connection, resp.printResponse().c_str(), strlen(resp.printResponse().c_str()), 0);
+        send(connection, &resp.body.data()[0], resp.body.size(), 0);
+        LOG(INFO) << std::to_string(id) << ": "
+                  << "Responding " << resp.firstLine;
+        close(connection);
+      }
+      else
+      {
+        lock.lock();
+        cache.storeRequestInCache(req, validationResponse, id);
+        lock.unlock();
+
+        send(connection, validationResponse.printResponse().c_str(), strlen(validationResponse.printResponse().c_str()), 0);
+        send(connection, &validationResponse.body.data()[0], validationResponse.body.size(), 0);
+        LOG(INFO) << std::to_string(id) << ": "
+                  << "Responding " << validationResponse.firstLine;
+        close(connection);
+      }
+
+      return;
+    }
+    else
+    {
+      LOG(INFO) << std::to_string(id) << ": "
+                << "in cache, valid";
+      send(connection, resp.printResponse().c_str(), strlen(resp.printResponse().c_str()), 0);
+      send(connection, &resp.body.data()[0], resp.body.size(), 0);
+      LOG(INFO) << std::to_string(id) << ": "
+                << "Responding " << resp.firstLine;
+      close(connection);
+      return;
+    }
+  }
+  else
+  {
+    lock.unlock();
+    if (req.method == "GET")
+    {
+      LOG(INFO) << std::to_string(id) << ": "
+                << "not in cache" << std::endl;
+    }
+  }
+
+  Socket sendSocket(req.host, req.port);
+
+  Sender sender;
+
+  HtmlResponse resp = sender.send(req.printRequest(), sendSocket);
+
+  close(sendSocket.sockfd);
+  std::cout << "sending" << std::endl;
+  send(connection, resp.printResponse().c_str(), strlen(resp.printResponse().c_str()), 0);
+  std::cout << "sending1" << std::endl;
+  send(connection, &resp.body.data()[0], resp.body.size(), 0);
+  std::cout << "sending2" << std::endl;
+  lock.lock();
+  cache.storeRequestInCache(req, resp, id);
+  lock.unlock();
+  std::cout << "Cache size: " << cache.cache.size() << std::endl;
+
+  close(connection);
 }
 
 int main(int argc, char const *argv[])
 {
   std::cout << "Hello Docker container!" << std::endl;
 
+  Cache cache;
 
+  Socket rcvSocket(AF_INET, SOCK_STREAM, 0);
 
-  // Create a socket (IPv4, TCP)
-  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sockfd == -1) {
-    std::cout << "Failed to create socket. errno: " << errno << std::endl;
-    exit(EXIT_FAILURE);
-  }
   std::cout << "socket" << std::endl;
 
-  // Listen to port 9999 on any address
   sockaddr_in sockaddr;
   sockaddr.sin_family = AF_INET;
   sockaddr.sin_addr.s_addr = INADDR_ANY;
-  sockaddr.sin_port = htons(9999); // htons is necessary to convert a number to
-                                   // network byte order
-  if (bind(sockfd, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) < 0) {
+  sockaddr.sin_port = htons(12345); // htons is necessary to convert a number to
+                                    // network byte order
+  if (bind(rcvSocket.sockfd, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) < 0)
+  {
     std::cout << "Failed to bind to port 9999. errno: " << errno << std::endl;
     exit(EXIT_FAILURE);
   }
 
-    int len_out_fds = 10;
-
-    int outsockfds[len_out_fds];
-
-    memset( outsockfds, 0, len_out_fds*sizeof(int) );
-
-    // Create a socket (IPv4, TCP)
-    // for (size_t i = 0; i < len_out_fds; i++)
-    // {
-    //     outsockfds[i] = socket(AF_INET, SOCK_STREAM, 0);
-    //     if (sockfd == -1) {
-    //         std::cout << "Failed to create socket. errno: " << errno << std::endl;
-    //         exit(EXIT_FAILURE);
-    //     }
-    //     std::cout << "socket" << std::endl;
-
-    //     // Listen to port 9999 on any address
-    //     sockaddr_in sockaddr;
-    //     sockaddr.sin_family = AF_INET;
-    //     sockaddr.sin_addr.s_addr = INADDR_ANY;
-    //     sockaddr.sin_port = htons(10000+i); // htons is necessary to convert a number to
-    //                                     // network byte order
-    //     if (bind(outsockfds[i], (struct sockaddr*)&sockaddr, sizeof(sockaddr)) < 0) {
-    //         std::cout << "Failed to bind to port 9999. errno: " << errno << std::endl;
-    //         exit(EXIT_FAILURE);
-    //     }
-    // }
-    
-
+  int len_out_fds = 10;
 
   std::cout << "bound" << std::endl;
 
   // Start listening. Hold at most 10 connections in the queue
-  if (listen(sockfd, 10) < 0) {
+
+  if (listen(rcvSocket.sockfd, 10) < 0)
+  {
     std::cout << "Failed to listen on socket. errno: " << errno << std::endl;
     exit(EXIT_FAILURE);
   }
 
   std::cout << "listened" << std::endl;
 
+  std::string filepath = "proxy.log";
+  // Logger::startLog(filepath);
+
+  el::Configurations conf("logger.conf");
+  // Reconfigure single logger
+  el::Loggers::reconfigureLogger("default", conf);
+  // Actually reconfigure all loggers instead
+  el::Loggers::reconfigureAllLoggers(conf);
+  // Now all the loggers will use configuration from file
+  LOG(INFO) << "My first info log using default logger";
+  LOG(INFO) << "My sec info log using default logger";
+  LOG(INFO) << "My third info log using default logger";
+  // ThreadPool threadPool(cache);
+  std::cout << "accepting" << std::endl;
+  int id = 1;
   while (1)
   {
-      // Grab a connection from the queue
-  auto addrlen = sizeof(sockaddr);
-  int connection = accept(sockfd, (struct sockaddr*)&sockaddr, (socklen_t*)&addrlen);
-  if (connection < 0) {
-    std::cout << "Failed to grab connection. errno: " << errno << std::endl;
-    exit(EXIT_FAILURE);
-  }
-
-
-  std::cout << "connected" << std::endl;
-
-//   std::thread t1(task1, "Hello");
-//   std::thread t2(task1, "yeet");
-
-//   std::thread t3(task1, "meet");
-
-  // Read from the connection
-  char buffer[10000];
-  auto bytesRead = read(connection, buffer, 10000);
-
-  std::string s = buffer;
-
-  std::cout << s << std::endl;
-
-  HtmlRequest req (buffer);
-
-  std::cout << req.method << std::endl;
-  std::cout << req.url << std::endl;
-  std::cout << req.requestLine << std::endl;
-  std::cout << req.protocol << std::endl;
-  std::cout << req.host << std::endl;
-  std::cout << "port: "<<req.port << std::endl;
-  std::cout << req.headersAndBody << std::endl;
-
-  std::cout << "done wid it" << std::endl;
-
-
-  std::cout << req.printRequest() << std::endl;
-
-
-std::cout << "done wid it1" << std::endl;
-
-
-    
-    struct addrinfo *addr;
-        int x;
-    ptrdiff_t fd;
-std::cout << "done wid it2" << std::endl;
-
-
-    // hostname = "google.com";
-
-    bzero(&addr, sizeof(addr));
-    std::cout << "done wid it3" << std::endl;
-
-    std::string port = req.port;
-std::cout << req.host.c_str() << std::endl;
-    x =  getaddrinfo(req.host.c_str(), "80", NULL, &addr);
-    fd = socket(addr->ai_family, SOCK_STREAM, 0);
-
-        std::cout << addr->ai_addr << std::endl;
-    std::cout << port << std::endl;
-    
-    x = connect(fd, addr->ai_addr, (int)addr->ai_addrlen);
-
-    std::cout << x << std::endl;
-    
-        if (x < 0){
-        std::cout << "ERROR CONNECTING1 :(" << std::endl;
-        
+    // Grab a connection from the queue
+    auto addrlen = sizeof(sockaddr);
+    int connection = accept(rcvSocket.sockfd, (struct sockaddr *)&sockaddr, (socklen_t *)&addrlen);
+    if (connection < 0)
+    {
+      std::cout << "Failed to grab connection. error: " << errno << std::endl;
+      exit(EXIT_FAILURE);
     }
 
-    std::cout << "CONNECTED!!!!!1 :)))" << std::endl;
-
-
-    // struct hostent *server = gethostbyname("www.google.com");
-
-        
-
-    // if (server == NULL) error("ERROR, no such host");
-
-//     int i = 0;
-//      outsockfds[i] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-//         if (sockfd == -1) {
-//             std::cout << "Failed to create socket. errno: " << errno << std::endl;
-//             exit(EXIT_FAILURE);
-//         }
-//         std::cout << "socket" << std::endl;
-
-
-//         // host = gethostbyname(url.c_str());
-        
-
-//         // Listen to port 9999 on any address
-//         sockaddr_in sockaddr;
-//         sockaddr.sin_family = AF_INET;
-//         sockaddr.sin_addr.s_addr = *((unsigned long*) server->h_addr);//inet_addr(host.c_str());
-
-//         // memcpy(&sockaddr.sin_addr.s_addr,server->h_addr,server->h_length);
-//         sockaddr.sin_port = htons(8888+i); // htons is necessary to convert a number to
-//                                         // network byte order
-// std::cout << host << std::endl;
-// std::cout << server->h_addr << std::endl;
-
-//     if (connect(sockfd,(struct sockaddr *)&sockaddr,sizeof(sockaddr)) < 0){
-//         std::cout << "ERROR CONNECTING" << std::endl;
-        
-//     }
-
-    size_t total, received, sent, bytes;
-
-    char response[100000];
-
-
-    total = strlen(req.printRequest().c_str());
-    sent = 0;
-    do {
-        bytes = write(fd,req.printRequest().c_str()+sent,total-sent);
-        if (bytes < 0)
-            std::cout << "ERROR writing message to socket" << std::endl;
-        if (bytes == 0)
-            break;
-        sent+=bytes;
-    } while (sent < total);
-
-    std::cout << "sent" << std::endl;
-
-    std::cout << req.printRequest().c_str() << std::endl;
-
-    /* receive the response */
-    memset(response,0,sizeof(response));
-    total = sizeof(response)-1;
-    
-
-    std::cout << "sent1" << std::endl;
-
-    bytes = read(fd,response+received,total-received);
-
-    received = bytes;
-
-    // send(connection, response+received, strlen(response), 0);
-
-    // if chunked
-    // std::string delimiter = "\r\n";
-    // do { 
-    //     bytes = read(fd,response+received,total-received);
-    //     if (bytes < 0)
-    //         std::cout << "ERROR reading response from socket" << std::endl;
-    //     if (bytes == 0)
-    //         break;
-    //     received+=bytes;
-
-    //     std::string recent = response+received;
-    //     std::cout << recent << std::endl;
-    //     // int pos = recent.find(delimiter);
-
-        
-
-    //     if (received >3){
-    //         // std::cout << "rec" << std::endl;;
-    //         // std::cout << response + received - 4 << std::endl;
-    //         std::string lastFour =  response + received - 4;
-    //         if (lastFour == "\r\n\r\n"){ // not technically reading the bytes in a chunked manner, but it's ok
-    //             std::cout << "response complete" << std::endl;
-    //             break;
-    //         }
-    //     }
-    //     // std::cout << bytes << std::endl;
-        
-    // } while (received < total);
-
-    std::cout << "recieved" << std::endl;
-
-    std::cout << bytes << std::endl;
-
-    std::cout << response << std::endl;
-
-    std::cout << received << std::endl;
-
-    // std::cout << "recieved" << std::endl;
-
-    // if (connect(outsockfds[i], (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == -1) {
-    //     perror("connect");
-    //     exit(EXIT_FAILURE);
-    // }
-    // std::cout << "Connected " << errno << std::endl;
-
-    // t3.join();
-  // Send a message to the connection
-//   std::string response = "Good talking to you\n";
-  send(connection, response, strlen(response), 0);
-
-
-
-
-    close(connection); 
-
-
-
-
-  
-
+    thread t1(run, connection, id);
+    t1.detach();
+    id++;
   }
-  close(sockfd);
-  
+  close(rcvSocket.sockfd);
 
   // Close the connections
-
 
   return 0;
 }

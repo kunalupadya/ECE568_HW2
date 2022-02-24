@@ -7,10 +7,12 @@
 #include <iostream> // For cout
 // #include <unistd.h> // For read
 #include <map>
+#include <iterator>
+#include <sstream>
 
-HtmlResponse::HtmlResponse(char *buffer)
+HtmlResponse::HtmlResponse(std::vector<char> buffer)
 {
-    std::string s = buffer;
+    std::string s(buffer.begin(), buffer.end());
     std::string delimiter = "\r\n";
 
     size_t pos = 0;
@@ -21,129 +23,115 @@ HtmlResponse::HtmlResponse(char *buffer)
     std::string header_key;
     std::string header_val;
 
-    std::string response;
+    std::string request;
+    start_len = 0;
 
-    pos = s.find(delimiter); // original response
-    response = s.substr(0, pos);
+    pos = s.find(delimiter); // original get request
+    request = s.substr(0, pos);
 
-    requestLine = response;
-    std::cout << response << std::endl;
+    firstLine = request;
+
     s.erase(0, pos + delimiter.length());
+    start_len += pos + delimiter.length();
 
     headersAndBody = s;
 
-    std::cout << "headersAndBody:\n"
-              << headersAndBody << std::endl;
+    std::cout << "headers parse: "
+              << "\r\n";
 
     while ((pos = s.find(delimiter)) != std::string::npos)
     {
-        std::cout << ":o" << std::endl;
         token = s.substr(0, pos);
 
         size_t kv_break = token.find(": ");
 
         if (kv_break == -1)
         { // message body
-            body = token;
+            // body = token;
+            HtmlResponse::parseBody(buffer);
             break;
         }
 
         header_key = token.substr(0, kv_break);
         header_val = token.substr(kv_break + 2, token.length());
 
-        std::cout << header_key << std::endl;
-        std::cout << header_val << std::endl;
-
         m[header_key] = header_val;
 
-        std::cout << ":p" << std::endl;
         s.erase(0, pos + delimiter.length());
+        start_len += pos + delimiter.length();
     }
 
-    std::cout << "done" << std::endl;
+    std::cout << "body parsed: "
+              << "\r\n";
     delimiter = " ";
 
-    std::cout << "request: " << response << std::endl;
-    std::cout << "delimiter: " << delimiter << std::endl;
-    pos = response.find(delimiter); // original  response
+    pos = request.find(delimiter); // original get request
 
-    // request =
-    method = response.substr(0, pos);
-    std::cout << "method: " << method << std::endl;
-    response.erase(0, pos + delimiter.length());
+    protocol = request.substr(0, pos);
+    request.erase(0, pos + delimiter.length());
 
-    pos = response.find(delimiter);
-    url = response.substr(0, pos);
-    std::cout << "url: " << url << std::endl;
-    response.erase(0, pos + delimiter.length());
+    pos = request.find(delimiter);
+    resp_type = request.substr(0, pos);
+    request.erase(0, pos + delimiter.length());
 
-    protocol = response.substr(0, pos);
-    std::cout << "protocol: " << protocol << std::endl;
-    response.erase(0, pos + delimiter.length());
+    message = request.substr(0, pos);
+    request.erase(0, pos + delimiter.length());
 
     delimiter = "http://";
 
-    bool parsed = HtmlResponse::parseUrl("http://");
-    if (!parsed)
-    {
-        parsed = HtmlResponse::parseUrl("https://");
-    }
-    if (!parsed)
-    {
-        parsed = HtmlResponse::parseUrl("");
-    }
-    std::cout << "parsed: " << parsed << std::endl;
+    std::cout << "url parsing: "
+              << "\r\n";
 }
 
-bool HtmlResponse::parseUrl(std::string delimiter)
+std::string HtmlResponse::printHeaders()
 {
 
-    if (delimiter == "")
+    std::stringstream ss;
+    for (std::map<std::string, std::string>::iterator it = m.begin(); it != m.end(); it++)
     {
-        HtmlResponse::parseUrl("https://");
+        ss << it->first // string (key)
+           << ':'
+           << it->second // string's value
+           << "\r\n";
     }
+    return ss.str();
+}
 
-    int pos;
-    if ((pos = url.find(delimiter)) != std::string::npos)
+bool HtmlResponse::checkIfInHeaders(std::string s)
+{
+    std::map<std::string, std::string>::iterator iter = m.find(s);
+    if (iter != m.end())
     {
-        std::string scheme = url.substr(0, pos);
-        url.erase(0, pos + delimiter.length());
-        std::cout << "url1: " << url << std::endl;
-
-        delimiter = '/';
-        pos = url.find(delimiter);
-        std::cout << "pos: " << pos << std::endl;
-        std::cout << "pos: " << url.length() << std::endl;
-        host = url.substr(0, pos);
-        std::cout << "host: " << host << std::endl;
-
-        if (pos == -1)
-        {
-            url = "/";
-        }
-        else
-        {
-            url = "/" + url.substr(pos + delimiter.length());
-        }
-
-        delimiter = ':';
-        pos = host.find(delimiter);
-
-        if (pos != -1)
-        {
-            port = host.substr(pos + delimiter.length());
-            std::cout << "port: " << port << std::endl;
-        }
-        else
-        {
-            port = "80";
-        }
         return true;
     }
     return false;
 }
 
+std::string HtmlResponse::getHeader(std::string s)
+{ // should always be called after calling checkIfInHeaders, will crash otherwise
+    std::map<std::string, std::string>::iterator iter = m.find(s);
+    return iter->second;
+}
+
+void HtmlResponse::parseBody(std::vector<char> v) // s should contain the body
+{
+    std::stringstream ss;
+
+    if (checkIfInHeaders("Content-Length"))
+    {
+        // body = s.substr(2, 2+ atoi(getHeader("Content-Length").c_str()));// 2 to offset the /r/n
+        body = std::vector<char>(2 + v.begin() + start_len, 2 + v.begin() + start_len + atoi(getHeader("Content-Length").c_str()));
+    }
+    if (checkIfInHeaders("Transfer-Encoding"))
+    {
+        if (getHeader("Transfer-Encoding") == "chunked")
+        {
+            body = std::vector<char>(0);
+        }
+    }
+}
+
 std::string HtmlResponse::printResponse()
 {
-    return method + " " + url + " " + protocol + "\r\n" + headersAndBody;
+    return protocol + " " + resp_type + " " + message + "\r\n" + HtmlResponse::printHeaders() + "\r\n";
 }
